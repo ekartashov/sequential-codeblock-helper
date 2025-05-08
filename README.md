@@ -68,7 +68,7 @@ optional arguments:
 
 Input file (`example.md`):
 
-```markdown
+~~~markdown
 # Disk Setup Guide
 
 ```bash <!-- SEQUENTIAL_CODEBLOCK -->
@@ -89,7 +89,7 @@ PART2=${DRIVE}2
 mkfs.vfat -F32 "$PART1"
 mkfs.ext4 "$PART2"
 ```
-```
+~~~
 
 Running the command:
 
