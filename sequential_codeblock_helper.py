@@ -15,8 +15,9 @@ from typing import Dict, List, Set, Tuple, Optional
 
 
 class SequentialCodeblockHelper:
-    def __init__(self, use_color: bool = True):
-        self.use_color = use_color
+    def __init__(self, use_color: bool = True, output_format: str = "text"):
+        self.use_color = use_color and output_format == "text"
+        self.output_format = output_format
         self.variables: Dict[str, str] = {}  # All variables defined across blocks
         self.block_count = 0
         
@@ -27,7 +28,7 @@ class SequentialCodeblockHelper:
             "deps": "\033[1;32m",  # Bold Green
             "separator": "\033[1;35m",  # Bold Magenta
             "reset": "\033[0m",
-        } if use_color else {"header": "", "original": "", "deps": "", "separator": "", "reset": ""}
+        } if self.use_color else {"header": "", "original": "", "deps": "", "separator": "", "reset": ""}
 
     def parse_markdown(self, content: str) -> List[str]:
         """Extract sequential code blocks from markdown content."""
@@ -49,10 +50,15 @@ class SequentialCodeblockHelper:
         if vars_match:
             sections['variables'] = vars_match.group(1).strip()
             
-        # Extract Script section or Dry-Run Script section
-        script_match = re.search(r'## (?:Dry-Run )?Script\n(.*?)(?=\n##|\Z)', block, re.DOTALL)
+        # Extract Script section
+        script_match = re.search(r'## Script\n(.*?)(?=\n##|\Z)', block, re.DOTALL)
         if script_match:
             sections['script'] = script_match.group(1).strip()
+            
+        # Extract Dry-Run Script section separately
+        dry_run_match = re.search(r'## Dry-Run Script\n(.*?)(?=\n##|\Z)', block, re.DOTALL)
+        if dry_run_match:
+            sections['dry_run_script'] = dry_run_match.group(1).strip()
             
         return sections
     
@@ -74,6 +80,36 @@ class SequentialCodeblockHelper:
                 defs[var_name] = var_value
                 
         return defs
+        
+    def expand_variables(self, value: str, all_vars: Dict[str, str], depth: int = 10) -> str:
+        """Recursively expand variables in a string."""
+        if depth <= 0:  # Prevent infinite recursion
+            return value
+        
+        # Check if the value contains any variable references
+        has_vars = re.search(r'\${[A-Za-z_][A-Za-z0-9_]*}|\$[A-Za-z_][A-Za-z0-9_]*(?!\w)', value)
+        if not has_vars:
+            return value
+            
+        # Expand ${VAR} style variables
+        for var_name in re.finditer(r'\${([A-Za-z_][A-Za-z0-9_]*)}', value):
+            name = var_name.group(1)
+            if name in all_vars:
+                placeholder = f"${{{name}}}"
+                # Recursively expand the variable's value first
+                expanded_var = self.expand_variables(all_vars[name], all_vars, depth - 1)
+                value = value.replace(placeholder, expanded_var)
+                
+        # Expand $VAR style variables
+        for var_name in re.finditer(r'(?<!\$)\$([A-Za-z_][A-Za-z0-9_]*)(?!\w)', value):
+            name = var_name.group(1)
+            if name in all_vars:
+                placeholder = f"${name}"
+                # Recursively expand the variable's value first
+                expanded_var = self.expand_variables(all_vars[name], all_vars, depth - 1)
+                value = value.replace(placeholder, expanded_var)
+                
+        return value
     
     def extract_variable_refs(self, block: str) -> Set[str]:
         """Extract variable references from a block."""
@@ -90,21 +126,45 @@ class SequentialCodeblockHelper:
             
         return refs
     
-    def get_dependencies(self, block: str, block_defs: Dict[str, str]) -> Dict[str, str]:
-        """Get variable dependencies for a block."""
-        # Variables referenced in this block
-        all_refs = self.extract_variable_refs(block)
+    def get_dependencies(self, sections: Dict[str, str], block_defs: Dict[str, str]) -> Dict[str, str]:
+        """Get variable dependencies for a block, including all referenced variables and their definitions."""
         
-        # Remove refs that are defined in this block
-        external_refs = all_refs - set(block_defs.keys())
+        # Variables referenced in the current block's script and variable sections
+        # (excluding those defined within the block itself)
+        current_block_content_for_refs = sections.get('script', '') + "\n" + sections.get('variables', '')
+        all_refs_in_current_block = self.extract_variable_refs(current_block_content_for_refs)
         
-        # Find definitions from previously defined variables
-        deps = {}
-        for var in external_refs:
-            if var in self.variables:
-                deps[var] = self.variables[var]
-                
-        return deps
+        # Filter out variables defined in the current block's "Variables" section
+        external_refs = all_refs_in_current_block - set(block_defs.keys())
+
+        # Use a list to maintain order and a set for quick lookups
+        ordered_deps_list: List[Tuple[str, str]] = []
+        deps_added_set: Set[str] = set()
+
+        def find_and_add_deps_recursively(var_names_to_process: Set[str]):
+            # Process a copy of the set to allow modification during iteration
+            for var_name in list(var_names_to_process):
+                if var_name in self.variables and var_name not in deps_added_set:
+                    var_value = self.variables[var_name]
+                    
+                    # Find dependencies of this variable's value
+                    nested_deps_in_value = self.extract_variable_refs(var_value)
+                    
+                    # Recursively add dependencies of the current variable's value first
+                    # This ensures that variables are defined before they are used in other definitions
+                    find_and_add_deps_recursively(nested_deps_in_value - deps_added_set - set(block_defs.keys()))
+                    
+                    # Add the current variable if it hasn't been added yet
+                    if var_name not in deps_added_set:
+                        ordered_deps_list.append((var_name, var_value))
+                        deps_added_set.add(var_name)
+        
+        # Start the recursive search with the initial external references
+        find_and_add_deps_recursively(external_refs)
+        
+        # Convert the list of tuples to a dictionary for the return type
+        # The order is preserved by how items were added to ordered_deps_list
+        return dict(ordered_deps_list)
     
     def print_separator(self, text: str, char: str, width: int = 80):
         """Print a separator line with text in the middle."""
@@ -112,8 +172,28 @@ class SequentialCodeblockHelper:
         left_pad = 10
         right_pad = width - left_pad - text_len
         
-        separator = char * left_pad + text + char * right_pad
-        print(f"{self.colors['separator']}{separator}{self.colors['reset']}")
+        # If it's the original block header, we need to make this a special case
+        if text == "Original Block: ":
+            # The original title's content plus a special marker
+            original_title_suffix = "+" * 43
+            separator = char * left_pad + text + original_title_suffix
+        else:
+            separator = char * left_pad + text + char * (width - left_pad - text_len)
+            
+        if self.output_format == "text":
+            print(f"{self.colors['separator']}{separator}{self.colors['reset']}")
+        elif self.output_format == "markdown":
+            if text.strip():  # If it's a header with text
+                print(f"### {text.strip()}")
+            else:  # Just a separator
+                print("\n---\n")
+        elif self.output_format == "html":
+            if "Block" in text:  # Block header
+                print(f"<h3 class='block-header'>{text}</h3>")
+            elif text == "Original Block: " or text == "With Dependencies: ":
+                print(f"<h4 class='section-header'>{text}</h4>")
+            else:  # Just a separator
+                print("<hr>")
     
     def process_block(self, block: str) -> None:
         """Process a single code block."""
@@ -127,19 +207,32 @@ class SequentialCodeblockHelper:
         if 'variables' in sections:
             block_defs = self.extract_variable_defs(sections['variables'])
             
+            # Expand any variables that might reference previously defined variables
+            expanded_defs = {}
+            for var_name, var_value in block_defs.items():
+                expanded_defs[var_name] = self.expand_variables(var_value, self.variables)
+            
             # Add to global variables
-            self.variables.update(block_defs)
+            self.variables.update(expanded_defs)
         else:
             block_defs = {}
             
         # Get dependencies for this block
-        deps = self.get_dependencies(block, block_defs)
+        deps = self.get_dependencies(sections, block_defs)
         
         # Print block header
         self.print_separator(block_header, "=")
         
         # Print original block
-        print(f"{self.colors['original']}## Original Block: {'+' * 43}{self.colors['reset']}")
+        if self.output_format == "text":
+            print(f"{self.colors['original']}## Original Block: {self.colors['reset']}")
+        elif self.output_format == "markdown":
+            print("#### Original Block")
+            print("```bash")
+        elif self.output_format == "html":
+            print("<div class='original-block'>")
+            print("<h4>Original Block</h4>")
+            print("<pre><code>")
         print()
         for section_name, content in sections.items():
             if section_name == 'preset':
@@ -151,10 +244,27 @@ class SequentialCodeblockHelper:
             elif section_name == 'script':
                 print(f"## Script")
                 print(f"{content}")
+            elif section_name == 'dry_run_script':
+                print(f"## Dry-Run Script")
+                print(f"{content}")
             print()
+        
+        if self.output_format == "markdown":
+            print("```")
+        elif self.output_format == "html":
+            print("</code></pre>")
+            print("</div>")
             
         # Print block with dependencies
-        print(f"{self.colors['deps']}## With Dependencies: {'+' * 43}{self.colors['reset']}")
+        if self.output_format == "text":
+            print(f"{self.colors['deps']}## With Dependencies: {self.colors['reset']}")
+        elif self.output_format == "markdown":
+            print("#### With Dependencies")
+            print("```bash")
+        elif self.output_format == "html":
+            print("<div class='dependencies-block'>")
+            print("<h4>With Dependencies</h4>")
+            print("<pre><code>")
         print()
         
         if not deps:
@@ -166,11 +276,20 @@ class SequentialCodeblockHelper:
                 print(f"## Preset Variables")
                 print(f"{sections['preset']}")
                 print()
-                print(f"## Variables")
-                print(f"{sections.get('variables', '')}")
-                print()
-                print(f"## Script")
-                print(f"{sections.get('script', '')}")
+                
+                if 'variables' in sections:
+                    print(f"## Variables")
+                    print(f"{sections['variables']}")
+                    print()
+                
+                if 'script' in sections:
+                    print(f"## Script")
+                    print(f"{sections['script']}")
+                    print()
+                
+                if 'dry_run_script' in sections:
+                    print(f"## Dry-Run Script")
+                    print(f"{sections['dry_run_script']}")
         else:
             # Print with dependencies
             print(f"## Preset Variables")
@@ -185,9 +304,26 @@ class SequentialCodeblockHelper:
             if 'script' in sections:
                 print(f"## Script")
                 print(f"{sections['script']}")
+                
+            if 'dry_run_script' in sections:
+                print(f"## Dry-Run Script")
+                print(f"{sections['dry_run_script']}")
         
+        if self.output_format == "markdown":
+            print("```")
+        elif self.output_format == "html":
+            print("</code></pre>")
+            print("</div>")
+            
         # Print block footer
-        print(f"{self.colors['separator']}{'+' * 80}{self.colors['reset']}")
+        if self.output_format == "text":
+            # Ensure separator is exactly 80 chars (not including ANSI color codes)
+            footer = '+' * 80
+            print(f"{self.colors['separator']}{footer}{self.colors['reset']}")
+        elif self.output_format == "markdown":
+            print("\n---\n")
+        elif self.output_format == "html":
+            print("<hr class='block-separator'>")
         print()
     
     def process_file(self, file_path: str) -> None:
@@ -202,11 +338,23 @@ class SequentialCodeblockHelper:
             # Process each block
             for block in blocks:
                 self.process_block(block)
+                # No longer updating variables with expansions globally
                 
             # Print final summary
-            print(f"{self.colors['separator']}{'=' * 80}{self.colors['reset']}")
-            print(f"Total blocks: {self.block_count}")
-            print(f"{self.colors['separator']}{'=' * 80}{self.colors['reset']}")
+            if self.output_format == "text":
+                # Ensure separator is exactly 80 chars
+                separator = '=' * 80
+                print(f"{self.colors['separator']}{separator}{self.colors['reset']}")
+                print(f"Total blocks: {self.block_count}")
+                print(f"{self.colors['separator']}{separator}{self.colors['reset']}")
+            elif self.output_format == "markdown":
+                print(f"**Total blocks: {self.block_count}**")
+                print("\n---\n")
+            elif self.output_format == "html":
+                print("<div class='summary'>")
+                print(f"<p><strong>Total blocks: {self.block_count}</strong></p>")
+                print("</div>")
+                print("<hr>")
             
         except FileNotFoundError:
             print(f"Error: File not found: {file_path}", file=sys.stderr)
@@ -235,7 +383,7 @@ def main():
         sys.stdout = open(args.output, 'w')
         
     # Create and run the processor
-    processor = SequentialCodeblockHelper(use_color=not args.no_color)
+    processor = SequentialCodeblockHelper(use_color=not args.no_color, output_format=args.format)
     processor.process_file(args.input_file)
     
     if args.output:

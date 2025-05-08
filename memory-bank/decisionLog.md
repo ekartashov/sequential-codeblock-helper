@@ -24,3 +24,5 @@ This makes it immediately clear which variables need to be defined for a block t
 
 ### Implementation Language
 Chose Python for its strong text processing capabilities, cross-platform compatibility, and ease of installation. Python's regex support and string manipulation functions are well-suited for this type of parsing task.
+
+[2025-05-08 21:27:17] - Refactored the `get_dependencies` method in `sequential_codeblock_helper.py` to recursively include the definitions of all referenced variables, rather than their expanded values. This ensures that variables are listed in the correct order in the 'Preset Variables' section. Updated tests to reflect this change.
